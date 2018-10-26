@@ -4,7 +4,7 @@
 
 ;; Author: Alex Harsanyi <AlexHarsanyi@gmail.com>
 ;; Created: 27 Sep 2006
-;; Version: 1.2
+;; Version: 1.3
 ;; Keywords: languages sql
 ;; Homepage: https://github.com/alex-hhh/emacs-sql-indent
 ;; Package-Requires: ((cl-lib "0.5"))
@@ -245,6 +245,14 @@ symbols and their meaning."
         (t
          (sqlind-find-context syntax-symbol (sqlind-outer-context context)))))
 
+(defun sqlind-looking-at-begin-transaction ()
+  "Return t if the point is on a \"begin transaction\" statement."
+  (and (looking-at "begin")
+       (save-excursion
+         (forward-word 1)
+         (sqlind-forward-syntactic-ws)
+         (looking-at "transaction"))))
+
 ;;;; Syntactic analysis of SQL code
 
 ;;;;; Find the beginning of the current statement
@@ -330,6 +338,10 @@ But don't go before LIMIT."
                      ;; assignment statements start at the assigned variable
                      (sqlind-backward-syntactic-ws)
                      (forward-sexp -1)
+                     (throw 'done (point)))
+                    ((sqlind-looking-at-begin-transaction)
+                     ;; This is a "begin transaction" call, statement begins
+                     ;; at "begin", see #66
                      (throw 'done (point)))
                     ((not (sqlind-in-comment-or-string (point)))
                      (throw 'done candidate-pos))))))))))
@@ -556,7 +568,7 @@ keywords in program code are matched, not the ones inside
 expressions.
 
 See also `sqlind-beginning-of-block'"
-  (when (looking-at "begin")
+  (when (and (looking-at "begin") (not (sqlind-looking-at-begin-transaction)))
     ;; a begin statement starts a block unless it is the first begin in a
     ;; procedure over which we need to skip it.
     (prog1  t                           ; make sure we return t
@@ -690,6 +702,10 @@ See also `sqlind-beginning-of-block'"
 			 (progn (sqlind-forward-syntactic-ws) (point))
 			 (progn (skip-syntax-forward "w_()") (point))))))
 
+          ;; Keep just the name, not the argument list
+          (when (string-match "\\(.*?\\)(" name)
+            (setq name (match-string 1 name)))
+
 	  (if (memq what '(procedure function package package-body))
 	      ;; check is name is in the form user.name, if so then suppress user part.
 	      (progn
@@ -787,31 +803,36 @@ end block and creates the appropiate syntactic context.
 See also `sqlind-beginning-of-block'"
   (when (looking-at "\\$\\$")
     (prog1 t
-      (let* ((saved-pos (point))
-             (previous-block (save-excursion
-                               (ignore-errors (forward-char -1))
-                               (cons (sqlind-beginning-of-block) (point))))
-             (previous-block-kind (nth 0 previous-block)))
-        (goto-char saved-pos)
-        (if (and (listp previous-block-kind)
-                 (eq (nth 0 previous-block-kind) 'defun-start))
-            (progn
-              (when (null sqlind-end-stmt-stack)
-                (throw 'finished (list 'in-begin-block 'defun (nth 1 previous-block-kind))))
-              (cl-destructuring-bind (pos kind _label) (pop sqlind-end-stmt-stack)
-                (unless (eq kind '$$)
-                  (throw 'finished
-                    (list 'syntax-error "bad closing for $$ begin block" (point) pos)))
-                (goto-char (cdr previous-block))))
-          ;; Assume it is an "end" statement
-          (push (list (point) '$$ "") sqlind-end-stmt-stack))))))
+      (let* ((saved-pos (point)))
+        (ignore-errors (forward-char -1))
+        (sqlind-backward-syntactic-ws)
+        (cond ((looking-at ";")
+               ;; Assume the $$ is ending a statement (previous line is a ';'
+               ;; which ends another statement)
+               (push (list saved-pos '$$ "") sqlind-end-stmt-stack)
+               (goto-char saved-pos))
+              ((null sqlind-end-stmt-stack)
+               (sqlind-beginning-of-statement)
+               (let ((syntax (catch 'finished
+                               (sqlind-maybe-create-statement)
+                               (sqlind-maybe-defun-statement)
+                               'toplevel)))
+                 (if (and (listp syntax) (eq (nth 0 syntax) 'defun-start))
+                     (throw 'finished (list 'in-begin-block 'defun (nth 1 syntax)))
+                   (throw 'finished (list 'in-begin-block syntax nil)))))
+              (t
+               (sqlind-beginning-of-statement)
+               (cl-destructuring-bind (pos kind _label) (pop sqlind-end-stmt-stack)
+                 (unless (eq kind '$$)
+                   (throw 'finished
+                     (list 'syntax-error "bad closing for $$ begin block" (point) pos))))))))))
 
 (defconst sqlind-start-block-regexp
   (concat "\\(\\_<"
 	  (regexp-opt '("if" "then" "else" "elsif" "loop"
 			"begin" "declare" "create" "alter" "exception"
-			"procedure" "function" "end" "case" "$$") t)
-	  "\\_>\\)\\|)")
+			"procedure" "function" "end" "case") t)
+	  "\\_>\\)\\|)\\|\\$\\$")
   "Regexp to match the start of a block.")
 
 (defun sqlind-beginning-of-block (&optional end-statement-stack)
@@ -939,10 +960,7 @@ reverse order (a stack) and is used to skip over nested blocks."
    "\\)\\_>"))
 
 (defconst sqlind-select-join-regexp
-  (concat "\\b"
-	  (regexp-opt '("inner" "left" "right" "natural" "cross") t)
-	  "[ \t\r\n\f]*join"
-	  "\\b"))
+  (regexp-opt '("inner" "left" "right" "natural" "cross") 'symbols))
 
 (defun sqlind-syntax-in-select (pos start)
   "Return the syntax ar POS which is inside a \"select\" statement at START."
@@ -991,22 +1009,28 @@ reverse order (a stack) and is used to skip over nested blocks."
 		 (when (or (looking-at "on")
 			   (progn (forward-word -1) (looking-at "on")))
 		   ;; look for the join start, that will be the anchor
-                   (when (sqlind-search-backward (point) sqlind-select-join-regexp start)
-                     (throw 'finished
-                       (cons 'select-join-condition (point))))))
+                   (when (sqlind-search-backward (point) "\\bjoin\\b" start)
+                     (let ((candidate (point)))
+                       (forward-char -1)
+                       (sqlind-backward-syntactic-ws)
+                       (backward-word)
+                       (throw 'finished
+                         (if (looking-at sqlind-select-join-regexp)
+                             (cons 'select-join-condition (point))
+                           (cons 'select-join-condition candidate)))))))
 
-		 ;; if this line starts with a ',' or the previous
-		 ;; line starts with a ',', we have a new table
-		 (goto-char pos)
-		 (when (or (looking-at ",")
-			   (progn
-                             (sqlind-backward-syntactic-ws)
-			     (looking-at ",")))
-		   (throw 'finished (cons 'select-table match-pos)))
-
-		 ;; otherwise, we continue the table definition from
-		 ;; the previous line.
-		 (throw 'finished (cons 'select-table-continuation match-pos)))
+	       ;; if this line starts with a ',' or the previous line starts
+	       ;; with a ',', we have a new table
+	       (goto-char pos)
+	       (when (or (looking-at ",")
+			 (progn
+                           (sqlind-backward-syntactic-ws)
+			   (looking-at ",")))
+		 (throw 'finished (cons 'select-table match-pos)))
+               
+	       ;; otherwise, we continue the table definition from the
+	       ;; previous line.
+	       (throw 'finished (cons 'select-table-continuation match-pos)))
 
 	      (t
 	       (throw 'finished
@@ -1488,7 +1512,8 @@ procedure block."
 
         (goto-char context-start)
         (when (or (>= context-start pos)
-                  (looking-at sqlind-start-block-regexp))
+                  (and (looking-at sqlind-start-block-regexp)
+                       (not (sqlind-looking-at-begin-transaction))))
           (goto-char pos)
           ;; if we are at the start of a statement, or the nearest statement
           ;; starts after us, make the enclosing block the starting context
@@ -2278,7 +2303,7 @@ See also `align' and `align-rules-list'")
 
 (defvar sqlind-minor-mode-map
   (let ((map (make-sparse-keymap)))
-    (define-key map [remap beginning-of-defun] 'sqlind-beginning-of-statement)
+    (define-key map [remap beginning-of-defun] 'sqlind-beginning-of-block)
     map))
 
 (defvar align-mode-rules-list)
