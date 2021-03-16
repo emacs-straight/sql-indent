@@ -497,7 +497,7 @@ We try to avoid false positives, like \"end if\" or the various
          (forward-word -1)
          ;; we don't want to match an "end if", and things like "drop index if
          ;; exists..." and "create index if not exist..."
-         (not (looking-at "end\\|schema\\|table\\|view\\|index\\|trigger\\|procedure\\|function\\|package\\|body")))))
+         (not (looking-at "end\\|schema\\|table\\|view\\|index\\|trigger\\|procedure\\|function\\|package\\|body\\|extension")))))
 
 (defun sqlind-maybe-if-statement ()
   "If (point) is on an IF statement, report its syntax."
@@ -2075,12 +2075,16 @@ anchor."
     (current-column)))
 
 (defun sqlind-use-previous-line-indentation (syntax _base-indentation)
-  "Return the indentation of the previous line.
+  "Return the indentation of the previous non-empty line.
 If the start of the previous line is before the anchor of SYNTAX,
 use the column of the anchor + 1."
   (let ((anchor (sqlind-anchor-point syntax)))
     (save-excursion
       (forward-line -1)
+      (beginning-of-line)
+      (while (and (looking-at "^\\s-*$") (> (point) anchor)) ; empty line, skip it
+        (forward-line -1)
+        (beginning-of-line))
       (back-to-indentation)
       (if (< (point) anchor)
 	  (progn
